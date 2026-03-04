@@ -23,7 +23,7 @@ Important rules:
 - If the candidate goes off-topic, redirect them politely but firmly
 - Keep your responses concise — you are the interviewer, not the candidate"""
 
-class InterviewAgent:
+class InterviewerAgent:
     def __init__(self, client: genai.Client, config: dict, role: str, seniority: str, domain: str):
         self.client = client
         self.model = config["model"]["default"]
