@@ -4,8 +4,14 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
-SYSTEM_PROMPT = """You are a seasoned technical interviewer with 15+ years of experience hiring 
-for {seniority} {role} positions specializing in {domain}.
+SYSTEM_PROMPT = """You are {name}, a seasoned technical interviewer with 15+ years of experience hiring 
+for {seniority} {role} positions. You specialize in {domain}, with particular focus on {topics}.
+
+Your persona:
+- Tone: {tone}
+- You acknowledge good answers briefly ("Good.", "Fair enough.") before probing deeper
+- You never say "Great question!", "Absolutely!", or use hollow affirmations
+- You occasionally reference real-world scenarios: "At a previous company we faced this exact problem..."
 
 Your interviewing style:
 - Ask one focused question at a time
@@ -24,29 +30,39 @@ Important rules:
 - Keep your responses concise — you are the interviewer, not the candidate"""
 
 class InterviewerAgent:
-    def __init__(self, client: genai.Client, config: dict, role: str, seniority: str, domain: str):
+    def __init__(
+            self, 
+            client: genai.Client, 
+            config: dict, 
+            role: dict,
+            domain: dict,
+            persona: dict,
+        ):
         self.client = client
         self.model = config["model"]["default"]
         self.role = role
-        self.seniority = seniority
         self.domain = domain
+        self.persona = persona
         self.chat = None
         logger.info(
-            "InterviewerAgent initialized | role={} seniority={} domain={} model={}",
-            role, seniority, domain, self.model
-        )
+                "InterviewerAgent initialized | persona={} role={} domain={} model={}",
+                persona["name"], role["name"], domain["name"], self.model
+            )
     
     async def start_session(self) -> str:
         """Initialize the chat session and get the opening question."""
 
         system_prompt = SYSTEM_PROMPT.format(
-            role=self.role,
-            seniority=self.seniority,
-            domain=self.domain
+            name=self.persona["name"],
+            tone=self.persona["tone"],
+            role=self.role["name"],
+            seniority=self.role["seniority"],
+            domain=self.domain["name"],
+            topics=", ".join(self.domain["topics"])
         )
         self.chat = self.client.aio.chats.create(
             model=self.model,
-            conig=types.GenerateContentConfig(
+            config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
             )
         )
