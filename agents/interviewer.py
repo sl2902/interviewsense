@@ -5,6 +5,7 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 END_SIGNAL = "[END_INTERVIEW]"
+END_SIGNAL_CONDUCT = "[END_INTERVIEW_CONDUCT]"
 
 SYSTEM_PROMPT = """You are {name}, a seasoned technical interviewer {experience} of experience hiring 
 for {seniority} {role} positions. A {seniority} {role} is expected to have {seniority_context}.
@@ -49,7 +50,7 @@ Important rules:
   Do not explain why you are ending it early.
 - When you have covered sufficient ground or the candidate has asked their closing questions,
   end the interview naturally and append exactly: [END_INTERVIEW]
-- If ending early due to candidate conduct, also append exactly: [END_INTERVIEW]"""
+- If the candidate appears unserious or unprofessional, end politely and append: [END_INTERVIEW_CONDUCT]"""
 
 class InterviewerAgent:
     def __init__(
@@ -120,6 +121,12 @@ class InterviewerAgent:
             
             response = await self.chat.send_message(candidate_input)
             reply = response.text.strip()
+
+            # conduct-based end — always respected
+            if END_SIGNAL_CONDUCT in reply:
+                reply = reply.replace(END_SIGNAL_CONDUCT, "").strip()
+                logger.info("Interviewer ended session due to candidate conduct")
+                return reply, True
             
             is_end = END_SIGNAL in reply
             reply = reply.replace(END_SIGNAL, "").strip()
