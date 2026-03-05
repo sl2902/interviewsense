@@ -20,13 +20,46 @@ async def test_next_turn_returns_interviewer_response(agent, mock_client, mocker
     agent.chat = mock_client.aio.chats.create.return_value
     agent.chat.send_message = mocker.AsyncMock(return_value=mock_response)
 
-    result = await agent.next_turn("I built an ETL pipeline using Spark and Airflow.")
+    response, is_end = await agent.next_turn("I built an ETL pipeline using Spark and Airflow.")
 
-    assert isinstance(result, str)
-    assert len(result) > 0
+    assert isinstance(response, str)
+    assert len(response) > 0
+    assert is_end is False
+
     agent.chat.send_message.assert_called_once_with(
         "I built an ETL pipeline using Spark and Airflow."
     )
+
+async def test_next_turn_detects_end_signal(agent, mock_client, mocker):
+    mock_response = mocker.MagicMock()
+    mock_response.text = "Thanks for your time. We'll be in touch. [END_INTERVIEW]"
+    agent.chat = mock_client.aio.chats.create.return_value
+    agent.chat.send_message = mocker.AsyncMock(return_value=mock_response)
+    agent.turn_count = agent.min_turns
+
+    response, is_end = await agent.next_turn("No questions from my side.")
+    assert is_end is True
+    assert "[END_INTERVIEW]" not in response
+
+async def test_next_turn_ignores_end_signal_before_min_turns(agent, mock_client, mocker):
+    mock_response = mocker.MagicMock()
+    mock_response.text = "Thanks for your time. [END_INTERVIEW]"
+    agent.chat = mock_client.aio.chats.create.return_value
+    agent.chat.send_message = mocker.AsyncMock(return_value=mock_response)
+    agent.turn_count = agent.min_turns - 2 # 1 less than min_turns
+
+    response, is_end = await agent.next_turn("No questions from my side.")
+
+    assert is_end is False
+
+async def test_next_turn_ends_at_max_turns(agent, mock_client, mocker):
+    agent.chat = mock_client.aio.chats.create.return_value
+    agent.turn_count = agent.max_turns
+
+    response, is_end = await agent.next_turn("some input")
+
+    assert is_end is True
+    assert isinstance(response, str)
 
 async def test_next_turn_raises_if_session_not_started(agent):
     with pytest.raises(RuntimeError, match="Session not started"):
@@ -39,3 +72,15 @@ async def test_next_turn_raises_on_api_error(agent, mock_client, mocker):
 
     with pytest.raises(Exception, match="API error"):
         await agent.next_turn("some input")
+
+async def test_start_session_returns_opening_question(agent, mock_client, mocker):
+    mock_response = mocker.MagicMock()
+    mock_response.text = "Begin the interview with a brief professional greeting and your first warm-up question."
+    agent.chat = mock_client.aio.chats.create.return_value
+    agent.chat.send_message = mocker.AsyncMock(return_value=mock_response)
+    result = await agent.start_session()
+
+    assert isinstance(result, str)
+    assert len(result) > 0
+    assert result == mock_response.text.strip()
+    assert agent.turn_count == 1 
