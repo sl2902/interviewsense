@@ -6,17 +6,24 @@ def mock_config():
         "model": {"default": "gemini-2.0-flash-001"},
         "interview": {
             "personas": {
-                "alex": {"name": "Alex", "tone": "calm, direct, and professional"}
+                "alex": {"name": "Alex", "tone": "calm, direct, and professional", "experience": "15+ years"},
             },
             "roles": {
-                "data_engineer": {"name": "Data Engineer", "seniority": "Senior"}
+                "data_engineer": {
+                    "name": "Data Engineer", 
+                    "seniority": "Senior", 
+                    "seniority_context": "5+ years experience, expected to lead pipeline design and mentor juniors",
+                    "strictness": "high"
+                },
             },
             "domains": {
                 "data_engineering": {
                     "name": "Data Engineering",
-                    "topics": ["ETL pipelines", "data modeling"]
-                }
-            }
+                    "topics": ["ETL pipelines", "data modeling"],
+                },
+            },
+            "max_turns": 20,
+            "min_turns": 8,
         }
     }
 
