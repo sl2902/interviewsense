@@ -49,8 +49,12 @@ async def run_interview(agent: InterviewerAgent):
             log.info("Interview session ended by candidate")
             break
 
-        response = await agent.next_turn(candidate_input)
-        log.info(f"\nInterviewer: {response.text}\n")
+        response, is_end = await agent.next_turn(candidate_input)
+        log.info(f"\nInterviewer: {response}\n")
+
+        if is_end:
+            log.info("Interview session completed")
+            break
 
 async def main():
     log.info("InterviewSense starting up")
