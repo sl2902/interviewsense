@@ -1,6 +1,6 @@
 import pytest
 
-pytestmark = pytest.mark.asyncio
+# pytestmark = pytest.mark.asyncio
 
 async def test_start_session_returns_opening_question(agent, mock_client, mocker):
     mock_response = mocker.MagicMock()
@@ -40,6 +40,18 @@ async def test_next_turn_detects_end_signal(agent, mock_client, mocker):
     response, is_end = await agent.next_turn("No questions from my side.")
     assert is_end is True
     assert "[END_INTERVIEW]" not in response
+
+async def test_next_turn_respects_conduct_end_before_min_turns(agent, mock_client, mocker):
+    mock_response = mocker.MagicMock()
+    mock_response.text = "We'll have HR follow up with you shortly. [END_INTERVIEW_CONDUCT]"
+    agent.chat = mock_client.aio.chats.create.return_value
+    agent.chat.send_message = mocker.AsyncMock(return_value=mock_response)
+    agent.turn_count = 0  # well before min_turns
+
+    response, is_end = await agent.next_turn("ugh whatever")
+
+    assert is_end is True
+    assert "[END_INTERVIEW_CONDUCT]" not in response
 
 async def test_next_turn_ignores_end_signal_before_min_turns(agent, mock_client, mocker):
     mock_response = mocker.MagicMock()
