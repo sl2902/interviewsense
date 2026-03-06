@@ -15,12 +15,15 @@ from session.models import Session, SessionStatus
 setup_logger()
 log = get_logger(__name__)
 
-def prompt_user_selection(cfg: dict) -> tuple[dict, dict, dict]:
+def prompt_user_selection(cfg: dict, opt: str = None) -> tuple[dict, dict, dict]:
     roles = cfg["interview"]["roles"]
     domains = cfg["interview"]["domains"]
     personas = cfg["interview"]["personas"]
 
     print("\n=== InterviewSense ===\n")
+
+    if opt:
+        return get_role(cfg, "data_engineer"), get_domain(cfg, "data_engineering"), get_persona(cfg, "alex")
 
     log.info(f"Available roles: {', '.join(roles.keys())}")
     role_key = input("Select role: ").strip().lower()
@@ -98,7 +101,15 @@ async def run_interview(
 async def main():
     log.info("InterviewSense starting up")
 
-    role, domain, persona = prompt_user_selection(config)
+    print("\nSelect interview mode:")
+    print("1. Text (terminal)")
+    print("2. Live (audio)")
+    mode = input("Mode: ").strip()
+
+    if mode == '2':
+        role, domain, persona = prompt_user_selection(config, '2')
+    else:
+        role, domain, persona = prompt_user_selection(config)
     log.info(
         "Session config | role={} domain={} persona={}",
         role, domain, persona
@@ -113,16 +124,33 @@ async def main():
     session = Session(role=role, domain=domain, persona=persona)
     log.info("Session created | session_id={}", session.session_id)
 
-    interviewer = InterviewerAgent(
-        client=client,
-        config=config,
-        role=role,
-        domain=domain,
-        persona=persona,
-    )
+    status = None
 
-    status = await run_interview(interviewer, session)
-    session.close(status=status)
+    if mode == "2":
+        from agents.live_interviewer import LiveInterviewerAgent
+        live_agent = LiveInterviewerAgent(
+            client=client,
+            config=config,
+            role=role,
+            domain=domain,
+            persona=persona
+        )
+
+        status = await live_agent.run(session)
+        session.close(status=status)
+    else:
+
+        interviewer = InterviewerAgent(
+            client=client,
+            config=config,
+            role=role,
+            domain=domain,
+            persona=persona,
+        )
+
+        status = await run_interview(interviewer, session)
+        session.close(status=status)
+
     log.info(
         "Session closed | status={} turns={}",
         status, len(session.turns)
