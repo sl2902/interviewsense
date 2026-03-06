@@ -30,12 +30,6 @@ class Turn(BaseModel):
     candidate_input: str
     interviewer_response: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class Turn(BaseModel):
-    turn_number: int = Field(ge=1)
-    candidate_input: str
-    interviewer_response: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     evaluation: Optional[TurnEvaluation] = None
 
 class Summary(BaseModel):
