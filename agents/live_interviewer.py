@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 
 
 class LiveInterviewerAgent:
-    def __init__(self, client, config, role, domain, persona):
+    def __init__(self, client, config, role, domain, persona, monitor_idx):
         self.client = client
         self.config = config
         self.model = config["model"]["live"]
@@ -41,6 +41,9 @@ class LiveInterviewerAgent:
         self.gemini_out_rate = self.output_cfg["sample_rate"]
 
         self.resampler_in = samplerate.Resampler("sinc_fastest", channels=self.input_cfg["channels"])
+
+        # Monitor index
+        self.monitor_idx = monitor_idx
 
         # Tracks whether audio is currently playing (used for drain + echo gate)
         self._playing = False
@@ -84,7 +87,7 @@ class LiveInterviewerAgent:
         return base
 
     def _build_live_config(self) -> types.LiveConnectConfig:
-        return types.LiveConnectConfig(
+        _config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=self._build_system_prompt(),
             speech_config=types.SpeechConfig(
@@ -112,7 +115,11 @@ class LiveInterviewerAgent:
                     silence_duration_ms=500,
                 )
             ),
+            # media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
         )
+        if self._mic_ready:
+            _config.media_resolution = types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+        return _config
 
     def _commit_turn(self, interview_session: Session) -> str:
         """Commit a turn if it has content.
@@ -399,12 +406,24 @@ class LiveInterviewerAgent:
 
                     # Enable mic after greeting finishes
                     if not self._mic_ready:
-                        if not interviewer_text and not self._got_greeting_audio:
-                            logger.warning("Empty greeting — will reconnect and retry.")
-                            self._session_handle = None
-                            break
                         self._mic_ready = True
-                        logger.info("Mic enabled — greeting complete.")
+                        logger.info("Mic enabled — session warm.")
+
+                        # First send_client_content on a fresh connection
+                        # always produces an empty turn_complete (no audio).
+                        # Now that the session is warm, re-send the greeting.
+                        if not interviewer_text and not self._got_greeting_audio:
+                            try:
+                                await self.session.send_client_content(
+                                    turns=[types.Content(
+                                        role="user",
+                                        parts=[types.Part(text="Please greet the candidate and begin the interview.")]
+                                    )],
+                                    turn_complete=True,
+                                )
+                                logger.info("Greeting prompt re-sent on warm session.")
+                            except Exception as e:
+                                logger.warning("Greeting re-send failed: {}", e)
 
             except asyncio.TimeoutError:
                 continue
@@ -414,6 +433,54 @@ class LiveInterviewerAgent:
             except Exception as e:
                 logger.error("Receiver error: {}: {}", type(e).__name__, e)
                 break
+    
+    async def _screen_capture_loop(self):
+        import mss
+        from PIL import Image
+        import io
+
+        # Wait for greeting to finish before initializing screen capture
+        while not self._mic_ready and not self.interview_complete:
+            await asyncio.sleep(0.5)
+        
+        if self.interview_complete:
+            return
+
+        def capture_frame(sct, monitor):
+            """Blocking: grab screen + resize + encode JPEG."""
+            screenshot = sct.grab(monitor)
+            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            img.thumbnail((768, 768), Image.LANCZOS)  # Preserve aspect ratio
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            return buf.getvalue()
+
+        with mss.mss() as sct:
+            monitor = sct.monitors[self.monitor_idx + 1]
+            logger.info("Screen capture started | monitor={} ({}x{})",
+                        self.monitor_idx, monitor["width"], monitor["height"])
+            
+            while not self.interview_complete:
+                # Don't stream frames during greeting
+                if not self._mic_ready:
+                    await asyncio.sleep(1.0)
+                    continue
+
+                try:
+                    frame_bytes = await asyncio.to_thread(capture_frame, sct, monitor)
+                    await self.session.send_realtime_input(
+                        media=types.Blob(
+                            data=frame_bytes, 
+                            mime_type="image/jpeg"
+                        )
+                    )
+                except Exception as e:
+                    logger.warning("Screen capture send error: {}", e)
+                    break
+
+                await asyncio.sleep(1.0)
+
+        logger.info("Screen capture stopped.")
 
     async def run(self, interview_session: Session) -> SessionStatus:
         logger.info("Opening Live Session...")
@@ -459,11 +526,13 @@ class LiveInterviewerAgent:
 
                         sender_task    = asyncio.create_task(self._sender_loop())
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                        screen_task    = asyncio.create_task(self._screen_capture_loop())
 
                         await self._receiver_loop(interview_session)
 
                         sender_task.cancel()
                         heartbeat_task.cancel()
+                        screen_task.cancel()
 
                 except Exception as e:
                     logger.error("Session error: {}: {}", type(e).__name__, e)
