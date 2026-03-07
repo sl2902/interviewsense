@@ -33,24 +33,27 @@ class LiveInterviewerAgent:
 
         self.input_cfg  = config["audio"]["input"]
         self.output_cfg = config["audio"]["output"]
+        self.system_cfg = config["audio"]["system"]["input"]
 
         # Hardware rate (mic/speaker) vs Gemini rates
-        self.hw_rate         = 48000
-        self.gemini_in_rate  = 16000   # Gemini accepts 16kHz input
-        self.gemini_out_rate = 24000   # Gemini outputs 24kHz audio
+        self.hw_rate         = self.system_cfg["sample_rate"]
+        self.gemini_in_rate  = self.input_cfg["sample_rate"]
+        self.gemini_out_rate = self.output_cfg["sample_rate"]
 
-        self.resampler_in = samplerate.Resampler("sinc_fastest", channels=1)
+        self.resampler_in = samplerate.Resampler("sinc_fastest", channels=self.input_cfg["channels"])
 
-        # Tracks whether audio is currently playing (used for drain logic)
+        # Tracks whether audio is currently playing (used for drain + echo gate)
         self._playing = False
 
         # Set by receiver when Gemini sends interruption — speaker checks this
         self._interrupted = False
 
         # Mic gating: don't send mic audio until greeting finishes
-        # (prevents ambient noise from killing the first response)
         self._mic_ready = False
         self._got_greeting_audio = False
+
+        # When True, the next turn_complete triggers graceful shutdown
+        self._wrapping_up = False
 
         # Graceful shutdown: let final audio finish before exiting
         self._draining = False
@@ -58,9 +61,12 @@ class LiveInterviewerAgent:
         # Session resumption handle (survives reconnects)
         self._session_handle = None
 
+        # Echo gate toggle: set to False when using headphones for barge-in
+        self._echo_gate = config.get("audio", {}).get("echo_gate", True)
+
         logger.info(
-            "LiveInterviewerAgent initialized | persona={} role={} domain={} voice={}",
-            persona["name"], role["name"], domain["name"], persona["voice"]
+            "LiveInterviewerAgent initialized | persona={} role={} domain={} voice={} echo_gate={}",
+            persona["name"], role["name"], domain["name"], persona["voice"], self._echo_gate
         )
 
     def _build_system_prompt(self) -> str:
@@ -90,11 +96,9 @@ class LiveInterviewerAgent:
             ),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             input_audio_transcription=types.AudioTranscriptionConfig(),
-            # Session resumption — explicit None on first connect per docs
             session_resumption=types.SessionResumptionConfig(
                 handle=self._session_handle
             ),
-            # Context window compression for longer sessions
             context_window_compression=types.ContextWindowCompressionConfig(
                 trigger_tokens=10000,
                 sliding_window=types.SlidingWindow(target_tokens=512),
@@ -105,45 +109,65 @@ class LiveInterviewerAgent:
                     start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                     prefix_padding_ms=20,
-                    silence_duration_ms=300,
+                    silence_duration_ms=500,
                 )
             ),
         )
 
-    def _commit_turn(self, interview_session: Session) -> bool:
-        candidate_input      = " ".join([t for t in self.candidate_buffer if t]).strip()
-        interviewer_response = " ".join([t for t in self.interviewer_buffer if t]).strip()
+    def _commit_turn(self, interview_session: Session) -> str:
+        """Commit a turn if it has content.
+        
+        Returns:
+            "continue"  — interview continues
+            "end"       — natural end or conduct end, no wrap-up needed
+            "wrap_up"   — max turns hit, send closing prompt
+        """
+        candidate_input      = " ".join([t.strip() for t in self.candidate_buffer if t]).strip()
+        interviewer_response = " ".join([t.strip() for t in self.interviewer_buffer if t]).strip()
 
         is_conduct_end = "[END_INTERVIEW_CONDUCT]" in interviewer_response
         is_natural_end = "[END_INTERVIEW]" in interviewer_response
 
-        if candidate_input or is_conduct_end or is_natural_end:
-            clean_response = (
-                interviewer_response
-                .replace("[END_INTERVIEW_CONDUCT]", "")
-                .replace("[END_INTERVIEW]", "")
-                .strip()
-            )
-            interview_session.add_turn(
-                candidate_input=candidate_input,
-                interviewer_response=clean_response,
-            )
-            logger.info(
-                "Turn committed | turn={} candidate_len={}",
-                len(interview_session.turns), len(candidate_input)
-            )
+        clean_response = (
+            interviewer_response
+            .replace("[END_INTERVIEW_CONDUCT]", "")
+            .replace("[END_INTERVIEW]", "")
+            .strip()
+        )
 
-        # Always clear buffers after turn completes
+        has_content = bool(candidate_input) or bool(clean_response)
+
+        if has_content or is_conduct_end or is_natural_end:
+            if has_content:
+                interview_session.add_turn(
+                    candidate_input=candidate_input,
+                    interviewer_response=clean_response,
+                )
+                logger.info(
+                    "Turn committed | turn={} candidate_len={} response_len={}",
+                    len(interview_session.turns), len(candidate_input), len(clean_response)
+                )
+
+        # Always clear buffers
         self.candidate_buffer.clear()
         self.interviewer_buffer.clear()
 
         if is_conduct_end:
             self.session_status = SessionStatus.TERMINATED_EARLY
-            return True
-        return is_natural_end
+            return "end"
+        if is_natural_end:
+            return "end"
+
+        # Check max turns; let the candidate complete the last question before graceful exit
+        max_turns = self.config["interview"]["max_turns"]
+        if has_content and len(interview_session.turns) > max_turns:
+            logger.info("Max turns reached | turns={}", len(interview_session.turns))
+            return "wrap_up"
+
+        return "continue"
 
     def _input_callback(self, indata, frames, time, status):
-        """Hardware float32 48kHz → int16 16kHz → queue."""
+        """Hardware float32 48kHz -> int16 16kHz -> queue."""
         if status:
             logger.warning("Mic Status: {}", status)
 
@@ -162,16 +186,16 @@ class LiveInterviewerAgent:
     async def _sender_loop(self):
         """Stream resampled mic audio to Gemini.
 
-        Mic is gated until greeting finishes (_mic_ready flag) to avoid
-        interfering with the initial send_client_content response.
-        After that, Gemini's built-in VAD handles echo cancellation
-        and barge-in detection — no echo gate needed.
+        Echo gate (configurable) mutes mic during playback to prevent
+        false interruptions from speaker echo. Disable echo_gate in
+        config when using headphones for barge-in support.
         """
         while not self.interview_complete:
             try:
                 chunk = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.01)
-                # Wait until greeting finishes before sending mic audio
                 if not self._mic_ready:
+                    continue
+                if self._echo_gate and self._playing:
                     continue
                 await self.session.send_realtime_input(
                     audio=types.Blob(
@@ -187,7 +211,7 @@ class LiveInterviewerAgent:
 
     async def _heartbeat_loop(self):
         """Send silent chunks every 5s to keep the connection alive."""
-        silent_chunk = b"\x00" * 320   # 10ms silence at 16kHz
+        silent_chunk = b"\x00" * 320
         while not self.interview_complete:
             try:
                 await self.session.send_realtime_input(
@@ -225,7 +249,6 @@ class LiveInterviewerAgent:
                     self._playing = True
                     self._interrupted = False
 
-                    # Play in small chunks so we can stop on interrupt
                     offset = 0
                     while offset < len(audio_data):
                         if self._interrupted:
@@ -253,7 +276,7 @@ class LiveInterviewerAgent:
 
     async def _receiver_loop(self, interview_session: Session):
         """
-        Receive responses using __anext__ with timeout — matches Google demo.
+        Receive responses using __anext__ with timeout.
         Returns normally on stream close so the outer loop can reconnect.
         """
         while not self.interview_complete:
@@ -262,7 +285,7 @@ class LiveInterviewerAgent:
                     self.session.receive().__anext__(), timeout=0.01
                 )
 
-                # Capture session resumption handle for reconnects
+                # Capture session resumption handle
                 if (
                     hasattr(response, "session_resumption_update")
                     and response.session_resumption_update
@@ -273,7 +296,6 @@ class LiveInterviewerAgent:
                         logger.info("Session handle saved for resumption.")
 
                 if not response.server_content:
-                    # Handle go_away notification (sent 60s before disconnect)
                     if hasattr(response, 'go_away') and response.go_away is not None:
                         logger.warning(
                             "GoAway received — connection ending soon. time_left={}",
@@ -300,7 +322,6 @@ class LiveInterviewerAgent:
                 if content.model_turn:
                     for part in content.model_turn.parts:
                         if part.inline_data:
-                            # Stream each chunk to speaker immediately
                             chunk = np.frombuffer(part.inline_data.data, dtype=np.int16)
                             await self.audio_out_queue.put(chunk)
                             if not self._mic_ready:
@@ -323,30 +344,65 @@ class LiveInterviewerAgent:
                         if display_text:
                             print(f"\nInterviewer: {display_text}\n")
 
-                    if self._commit_turn(interview_session):
-                        # Signal drain: let speaker finish the final audio
-                        # before marking interview as complete
+                    # If wrapping up, this is the closing statement — drain and exit
+                    if self._wrapping_up:
+                        self._commit_turn(interview_session)
                         self._draining = True
-                        logger.info("Interview ending — draining final audio...")
-
-                        # Wait for speaker to finish playing queued audio
+                        logger.info("Closing statement received — draining final audio...")
                         while not self.audio_out_queue.empty() or self._playing:
                             await asyncio.sleep(0.1)
-
                         self._draining = False
                         self.interview_complete = True
                         logger.info("Final audio drained. Interview complete.")
                         break
 
+                    result = self._commit_turn(interview_session)
+
+                    if result == "end":
+                        # Natural end or conduct end — already has closing,
+                        # just drain and exit
+                        self._draining = True
+                        logger.info("Interview ended — draining final audio...")
+                        while not self.audio_out_queue.empty() or self._playing:
+                            await asyncio.sleep(0.1)
+                        self._draining = False
+                        self.interview_complete = True
+                        logger.info("Final audio drained. Interview complete.")
+                        break
+
+                    elif result == "wrap_up":
+                        # Max turns — ask for closing statement, stay in loop
+                        self._wrapping_up = True
+                        logger.info("Sending wrap-up prompt...")
+                        try:
+                            await self.session.send_client_content(
+                                turns=[types.Content(
+                                    role="user",
+                                    parts=[types.Part(
+                                        text="Wrap up the interview now with a brief closing statement."
+                                    )]
+                                )],
+                                turn_complete=True,
+                            )
+                        except Exception as e:
+                            logger.error("Failed to send wrap-up: {}", e)
+                            self._draining = True
+                            while not self.audio_out_queue.empty() or self._playing:
+                                await asyncio.sleep(0.1)
+                            self._draining = False
+                            self.interview_complete = True
+                            break
+                        continue  # Stay in loop to get closing response
+
+                    # result == "continue"
                     logger.info("Turn complete. Keeping session alive...")
 
                     # Enable mic after greeting finishes
                     if not self._mic_ready:
-                        # Check if greeting actually produced content
                         if not interviewer_text and not self._got_greeting_audio:
                             logger.warning("Empty greeting — will reconnect and retry.")
-                            self._session_handle = None  # Reset so greeting retries
-                            break  # Exit receiver, outer loop reconnects
+                            self._session_handle = None
+                            break
                         self._mic_ready = True
                         logger.info("Mic enabled — greeting complete.")
 
@@ -371,11 +427,9 @@ class LiveInterviewerAgent:
             callback=self._input_callback,
         )
 
-        # Speaker runs outside the reconnection loop — survives reconnects
         speaker_task = asyncio.create_task(self._speaker_task())
 
         with mic_stream:
-            # ── Reconnection loop — mirrors Google demo's run_gemini_session ──
             while not self.interview_complete:
                 try:
                     logger.info(
@@ -390,13 +444,9 @@ class LiveInterviewerAgent:
                         self.session = session
                         logger.info("Live connection established.")
 
-                        # On reconnect, greeting already played — mic is ready
                         if self._session_handle is not None:
                             self._mic_ready = True
 
-                        # Trigger greeting on first connect.
-                        # Gemini responds, stream may close — reconnection
-                        # loop handles that via session resumption.
                         if self._session_handle is None:
                             await session.send_client_content(
                                 turns=[types.Content(
@@ -407,14 +457,11 @@ class LiveInterviewerAgent:
                             )
                             logger.info("Initial prompt sent.")
 
-                        # Sender + heartbeat as tasks (cancelled on stream close)
                         sender_task    = asyncio.create_task(self._sender_loop())
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-                        # Receiver runs here — returns on stream close
                         await self._receiver_loop(interview_session)
 
-                        # Clean up before reconnecting
                         sender_task.cancel()
                         heartbeat_task.cancel()
 
@@ -424,7 +471,6 @@ class LiveInterviewerAgent:
                         break
                     await asyncio.sleep(2)
 
-        # Clean up speaker
         speaker_task.cancel()
 
         # Flush any remaining buffers
