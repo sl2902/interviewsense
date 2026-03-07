@@ -1,6 +1,7 @@
 import pytest
 from session.models import (
     Session,
+    SessionStatus,
 )
 from agents.evaluator import (
     EvaluatorAgent,
@@ -21,7 +22,8 @@ def mock_config():
                 "alex": {
                     "name": "Alex", 
                     "tone": "calm, direct, and professional", 
-                    "experience": "15+ years"
+                    "experience": "15+ years",
+                    "voice": "Charon",
                 },
             },
             "roles": {
@@ -44,7 +46,29 @@ def mock_config():
                 "positive": ["good_depth", "clear_communication", "strong_example"],
                 "negative": ["vague", "lacks_depth", "buzzword_heavy"]
             }
-        }
+        },
+        "audio": {
+            "echo_gate": False,
+            "system": {
+                "input": {
+                    "sample_rate": 48000,
+                },
+                "output": {
+                    "sample_rate": 48000,
+                },
+            },
+            "input": {
+                "device": 0,
+                "sample_rate": 16000,
+                "channels": 1,
+                "chunk_size": 4096,
+            },
+            "output": {
+                "device": 1,
+                "channels": 2,
+                "sample_rate": 24000,
+            },
+        },
     }
 
 @pytest.fixture
@@ -124,3 +148,46 @@ def mock_evaluation_response():
         improvements=["provide more implementation details", "discuss trade-offs"],
         recommendation="hire"
     )
+
+@pytest.fixture
+def make_agent(mocker, mock_config):
+    def _make(max_turns=10):
+        mocker.patch(
+            "agents.live_interviewer.LiveInterviewerAgent.__init__",
+            lambda self, *args, **kw: None,
+        )
+        from agents.live_interviewer import LiveInterviewerAgent
+
+        agent = LiveInterviewerAgent.__new__(LiveInterviewerAgent)
+        agent.candidate_buffer = []
+        agent.interviewer_buffer = []
+        agent.session_status = SessionStatus.COMPLETED
+        agent.config = {"interview": {"max_turns": max_turns}}
+        agent.persona = mock_config["interview"]["personas"]["alex"]
+        agent.domain = mock_config["interview"]["domains"]["data_engineering"]
+        agent.role = mock_config["interview"]["roles"]["data_engineer"]
+        agent._session_handle = None
+        agent._echo_gate = False
+        return agent
+
+    return _make
+
+
+@pytest.fixture
+def make_session(mocker):
+    def _make(existing_turns=0):
+        session = mocker.MagicMock(spec=Session)
+        session.turns = [mocker.MagicMock() for _ in range(existing_turns)]
+
+        def add_turn_side_effect(candidate_input, interviewer_response):
+            session.turns.append(
+                mocker.MagicMock(
+                    candidate_input=candidate_input,
+                    interviewer_response=interviewer_response,
+                )
+            )
+
+        session.add_turn.side_effect = add_turn_side_effect
+        return session
+
+    return _make
