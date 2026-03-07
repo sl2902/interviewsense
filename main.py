@@ -23,7 +23,7 @@ def prompt_user_selection(cfg: dict, opt: str = None) -> tuple[dict, dict, dict]
     print("\n=== InterviewSense ===\n")
 
     if opt:
-        return get_role(cfg, "data_engineer"), get_domain(cfg, "data_engineering"), get_persona(cfg, "alex")
+        return get_role(cfg, "data_engineer"), get_domain(cfg, "data_engineering"), get_persona(cfg, "jordan")
 
     log.info(f"Available roles: {', '.join(roles.keys())}")
     role_key = input("Select role: ").strip().lower()
