@@ -1,5 +1,6 @@
 import asyncio
 from google import genai
+import mss
 from logger import setup_logger, get_logger
 
 from config import (
@@ -121,6 +122,13 @@ async def main():
         vertexai=True
     )
 
+    with mss.mss() as sct:
+        # index 0 is 'all monitors' combined
+        monitors = sct.monitors[1:]
+        for i, m in enumerate(monitors):
+            print(f"{i+1}. {m['width']}x{m['height']}")
+    monitor_idx = int(input("Select monitor: ")) - 1
+
     session = Session(role=role, domain=domain, persona=persona)
     log.info("Session created | session_id={}", session.session_id)
 
@@ -133,7 +141,8 @@ async def main():
             config=config,
             role=role,
             domain=domain,
-            persona=persona
+            persona=persona,
+            monitor_idx=monitor_idx,
         )
 
         status = await live_agent.run(session)
